@@ -1,45 +1,151 @@
-# rpi-configfs-usb-gadget
-Raspberry Pi Zero 2 W ConfigFS USB Composite Gadget
+# Raspberry Pi Zero 2 W USB Gadget / Host Mode
 
-This project configures a Raspberry Pi Zero 2 W as a USB composite gadget using **ConfigFS** and **libcomposite** instead of the legacy `g_ether` module.
+This package configures the Pi Zero 2 W OTG controller in one of two mutually exclusive modes:
 
-The default profile is designed for macOS and Linux and exposes:
+- `USB_MODE=gadget`: the Pi acts as a USB peripheral toward macOS/Linux/Windows.
+- `USB_MODE=host`: the Pi acts as a USB host for external USB devices such as Wi-Fi dongles or hubs.
 
-- **CDC ECM Ethernet**
-- **CDC ACM serial port**
-- **The real Raspberry Pi boot partition as USB Mass Storage**
+The same OTG controller cannot be host and gadget at the same time.
 
-A separate **RNDIS** profile is available for Windows.
-
-## Features
-
-- ConfigFS + `libcomposite`
-- CDC ECM for macOS/Linux
-- RNDIS profile for Windows
-- Persistent locally administered MAC addresses
-- MAC addresses generated only on the first activation
-- Static IPv4 address on the Raspberry Pi USB Ethernet interface
-- Optional CDC ACM serial interface
-- Optional export of the real boot partition as USB Mass Storage
-- Safe unmount before USB Mass Storage export
-- Boot partition remounted when the gadget is stopped
-- systemd integration
-- Automatic cleanup of an existing ConfigFS gadget
-- Installer updates the Raspberry Pi kernel command line and removes legacy `g_ether` options
-
-## Architecture
+## Files to copy to the boot partition
 
 ```text
-Raspberry Pi Zero 2 W
-│
-├── CDC ECM Ethernet     macOS / Linux
-│      └── usb0 (or kernel-assigned name)
-│          192.168.2.3/24
-│
-├── CDC ACM Serial
-│      └── /dev/ttyGS0
-│
-└── USB Mass Storage
+install-usb-gadget.sh
+usb-gadget
+usb-gadget.service
+usb-gadget.conf
+```
+
+`usb-gadget.conf` stays on the boot partition and is the configuration source of truth.
+
+## Gadget mode: macOS/Linux
+
+```bash
+USB_MODE=gadget
+PROFILE=ecm
+```
+
+This can expose:
+
+- CDC ECM Ethernet
+- optional CDC ACM serial
+- optional real boot partition as USB Mass Storage
+- persistent MAC addresses
+- static IPv4 on the Pi USB interface
+
+## Gadget mode: Windows
+
+```bash
+USB_MODE=gadget
+PROFILE=rndis
+```
+
+## USB host mode
+
+```bash
+USB_MODE=host
+```
+
+The installer configures the Device Tree overlay in `config.txt`:
+
+```text
+dtoverlay=dwc2,dr_mode=host
+```
+
+In gadget mode it uses:
+
+```text
+dtoverlay=dwc2,dr_mode=peripheral
+```
+
+A reboot is required when switching roles.
+
+## Offline installation from macOS
+
+Copy all four package files to the Raspberry Pi boot partition.
+
+Append the following arguments to the single line in `cmdline.txt`:
+
+```text
+systemd.run="/bin/bash /boot/firmware/install-usb-gadget.sh --offline-firstboot" systemd.run_success_action=none systemd.run_failure_action=none
+```
+
+If your distribution mounts the boot partition at `/boot`, use `/boot/install-usb-gadget.sh`.
+
+Then eject the boot volume cleanly and boot the Pi.
+
+The first boot:
+
+1. validates the package,
+2. backs up `cmdline.txt` and `config.txt`,
+3. removes legacy `g_ether` parameters,
+4. ensures `modules-load=dwc2`,
+5. sets the selected OTG role in `config.txt`,
+6. installs `/usr/local/sbin/usb-gadget`,
+7. installs/enables `usb-gadget.service`,
+8. removes temporary `systemd.run=...` parameters,
+9. reboots.
+
+The selected USB mode becomes active on the second boot.
+
+## Normal installation from Linux
+
+```bash
+sudo ./install-usb-gadget.sh
+sudo reboot
+```
+
+## Switching between gadget and host later
+
+Edit `usb-gadget.conf` on the boot partition.
+
+For USB host:
+
+```bash
+USB_MODE=host
+```
+
+Then:
+
+```bash
+sudo /boot/firmware/install-usb-gadget.sh
+sudo reboot
+```
+
+To return to ECM gadget mode:
+
+```bash
+USB_MODE=gadget
+PROFILE=ecm
+```
+
+Then rerun the installer and reboot.
+
+## Persistent MAC addresses
+
+On the first successful gadget start:
+
+```text
+/var/lib/usb-gadget/identity.conf
+```
+
+is created. The same MAC addresses are reused after reboot.
+
+## Boot partition export safety
+
+When `ENABLE_BOOT_STORAGE=yes`, the boot filesystem is unmounted locally before its raw block device is exposed over USB.
+
+Never mount the same filesystem read/write on the Pi and the USB host simultaneously.
+
+Always eject the boot volume cleanly from macOS before rebooting the Pi.
+
+## Useful commands
+
+```bash
+sudo /boot/firmware/install-usb-gadget.sh --check
+sudo systemctl status usb-gadget
+sudo /usr/local/sbin/usb-gadget status
+```
        └── real boot partition
            /dev/mmcblk0p1
 ```
