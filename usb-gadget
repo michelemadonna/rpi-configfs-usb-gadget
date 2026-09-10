@@ -238,6 +238,58 @@ EOF
 # ConfigFS / UDC
 # ------------------------------------------------------------
 
+detect_usb_role() {
+
+    local role_file
+    local role
+
+    for role_file in /sys/class/usb_role/*/role; do
+
+        [[ -r "$role_file" ]] || continue
+
+        role="$(cat "$role_file")"
+
+        case "$role" in
+            host)
+                printf 'host\n'
+                return 0
+                ;;
+
+            device|peripheral)
+                printf 'peripheral\n'
+                return 0
+                ;;
+        esac
+    done
+
+    if [[ -n "${UDC:-}" ]]; then
+        printf 'peripheral\n'
+        return 0
+    fi
+
+    if compgen -G '/sys/bus/usb/devices/usb*' >/dev/null; then
+        printf 'host\n'
+        return 0
+    fi
+
+    printf 'unknown\n'
+}
+
+
+refresh_usb_role() {
+
+    UDC="$(
+        find /sys/class/udc \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -printf '%f\n' 2>/dev/null |
+        head -n1
+    )"
+
+    USB_ROLE="$(detect_usb_role)"
+}
+
+
 prepare_configfs() {
 
     modprobe libcomposite
@@ -252,16 +304,75 @@ prepare_configfs() {
     [[ -d "$GADGET_ROOT" ]] ||
         die "USB Gadget ConfigFS interface unavailable"
 
-    UDC="$(
-        find /sys/class/udc \
-            -mindepth 1 \
-            -maxdepth 1 \
-            -printf '%f\n' 2>/dev/null |
-        head -n1
-    )"
+    refresh_usb_role
 
-    [[ -n "${UDC:-}" ]] ||
-        die "No USB Device Controller available"
+    case "$USB_ROLE" in
+        host)
+            log "USB controller is in host mode; gadget configuration will be skipped"
+            ;;
+
+        peripheral)
+            [[ -n "${UDC:-}" ]] ||
+                die "USB controller reports peripheral mode but no UDC is available"
+            ;;
+
+        *)
+            if [[ "${1:-strict}" == allow-unknown ]]; then
+                warn "Unable to determine USB controller role"
+            else
+                die "Unable to determine USB controller role and no UDC is available"
+            fi
+            ;;
+    esac
+}
+
+
+watch_gadget() {
+
+    local previous_role=""
+
+    log "Monitoring USB controller role"
+
+    while :; do
+
+        refresh_usb_role
+
+        case "$USB_ROLE" in
+
+            peripheral)
+
+                if [[ "$previous_role" != peripheral || ! -d "$GADGET" ]]; then
+
+                    if ! start_gadget; then
+                        warn "Unable to start the USB gadget; retrying"
+                    fi
+                fi
+                ;;
+
+            host)
+
+                if [[ "$previous_role" == peripheral ||
+                      -d "$GADGET" ||
+                      -e "${STATE_DIR}/network-interface" ]]; then
+
+                    if ! stop_gadget; then
+                        warn "Unable to stop the USB gadget; retrying"
+                    fi
+                fi
+                ;;
+
+            *)
+
+                if [[ "$previous_role" != unknown ]]; then
+                    warn "USB controller role is not available yet; retrying"
+                fi
+                ;;
+
+        esac
+
+        previous_role="$USB_ROLE"
+        sleep 1
+    done
 }
 
 
@@ -793,9 +904,14 @@ start_gadget() {
 
     load_config
 
-    load_or_create_identity
-
     prepare_configfs
+
+    if [[ "$USB_ROLE" == host ]]; then
+        log "External USB host mode detected; leaving the controller untouched"
+        return 0
+    fi
+
+    load_or_create_identity
 
     #
     # g_ether and ConfigFS must never compete for the UDC.
@@ -861,7 +977,7 @@ start_gadget() {
 
 stop_gadget() {
 
-    prepare_configfs
+    prepare_configfs allow-unknown
 
     local old_iface=""
     local boot_device=""
@@ -1004,6 +1120,11 @@ case "$ACTION" in
         start_gadget
         ;;
 
+    watch)
+
+        watch_gadget
+        ;;
+
     status)
 
         status_gadget
@@ -1012,7 +1133,7 @@ case "$ACTION" in
     *)
 
         printf \
-            'Usage: %s {start|stop|restart|status}\n' \
+            'Usage: %s {start|stop|restart|watch|status}\n' \
             "$0" >&2
 
         exit 2

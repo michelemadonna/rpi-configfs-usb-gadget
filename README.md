@@ -71,6 +71,15 @@ If `modules-load=` contains `g_ether`, remove only that module and leave
 modules-load=dwc2
 ```
 
+The installer does not rewrite `config.txt`. Leave exactly one DWC2 overlay
+line in that file:
+
+```text
+dtoverlay=dwc2
+```
+
+Do not add `dr_mode=host`, `dr_mode=peripheral`, or `dr_mode=otg`.
+
 ### 3. Add the first-boot ifupdown hook
 
 Edit the boot-side `interfaces` file:
@@ -94,7 +103,10 @@ configures the USB Ethernet interface itself. RPI copies the boot-side
 ### 4. First boot
 
 Eject the SD card cleanly, insert it into the Pi, and connect the USB data port
-to the host computer.
+to the host computer. When testing OTG role detection with an external USB
+adapter, use a real OTG cable or adapter with the USB ID pin wired correctly.
+Without the ID pin, the Pi cannot reliably distinguish a host connection from
+a device connection.
 
 The first boot performs this sequence:
 
@@ -332,5 +344,25 @@ grep -E 'CONFIG_USB_(LIBCOMPOSITE|CONFIGFS|CONFIGFS_ECM|CONFIGFS_RNDIS|CONFIGFS_
     /boot/config-$(uname -r)
 ```
 
-The Pi's DWC2 controller must be configured for peripheral/device mode. Do
-not configure it as a USB host while using this package.
+The Pi's DWC2 controller must have the standard overlay enabled:
+
+```text
+dtoverlay=dwc2
+```
+
+Do not add a `dr_mode=` parameter. The physical OTG cable's ID pin determines
+the USB role when an external host adapter is connected.
+
+The service stays active as a role monitor. If the controller is in peripheral
+mode, it creates and starts the gadget. If the controller changes to host mode,
+it tears down the gadget, restores the boot partition, and leaves the external
+USB adapter available. When the controller changes back to peripheral mode, it
+creates the gadget again automatically. The service does not need to be
+disabled or manually restarted for normal cable changes.
+
+If the kernel does not report a role change after replacing the cable or
+adapter, restart the service as a fallback:
+
+```bash
+sudo systemctl restart usb-gadget.service
+```

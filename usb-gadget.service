@@ -6,12 +6,13 @@ Wants=network-pre.target
 Before=network-pre.target
 
 [Service]
-Type=oneshot
+Type=simple
 
-ExecStart=/usr/local/sbin/usb-gadget start
+ExecStart=/usr/local/sbin/usb-gadget watch
 ExecStop=/usr/local/sbin/usb-gadget stop
 
-RemainAfterExit=yes
+Restart=on-failure
+RestartSec=2
 
 TimeoutStartSec=30
 TimeoutStopSec=30
