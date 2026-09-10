@@ -767,6 +767,8 @@ configure_dns() {
         done
     } > "$temporary"
 
+    chmod 0644 "$temporary"
+
     rm -f "$RESOLV_CONF"
     mv "$temporary" "$RESOLV_CONF"
 }
