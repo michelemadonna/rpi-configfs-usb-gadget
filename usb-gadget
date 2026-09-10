@@ -1,0 +1,1019 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# ============================================================
+# Raspberry Pi Zero 2 W ConfigFS USB Gadget
+#
+# Functions:
+#   - CDC ECM Ethernet       (macOS/Linux)
+#   - RNDIS Ethernet         (Windows)
+#   - CDC ACM serial         (optional)
+#   - Real boot partition    (optional USB Mass Storage)
+#
+# Persistent identity:
+#   /var/lib/usb-gadget/identity.conf
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Paths
+# ------------------------------------------------------------
+
+readonly CONFIG_FILE="${USB_GADGET_CONFIG_FILE:-/boot/firmware/usb-gadget.conf}"
+
+readonly DEFAULT_BOOT_STORAGE_DEVICE="/dev/mmcblk0p1"
+readonly DEFAULT_BOOT_STORAGE_MOUNT="/boot/firmware"
+
+readonly STATE_DIR="/var/lib/usb-gadget"
+readonly IDENTITY_FILE="${STATE_DIR}/identity.conf"
+readonly RESOLV_CONF="/etc/resolv.conf"
+readonly RESOLV_BACKUP="${STATE_DIR}/resolv.conf.usb-gadget.bak"
+readonly RESOLV_CREATED="${STATE_DIR}/resolv.conf.usb-gadget.created"
+
+readonly CONFIGFS="/sys/kernel/config"
+readonly GADGET_ROOT="${CONFIGFS}/usb_gadget"
+readonly GADGET="${GADGET_ROOT}/pizero"
+
+readonly CONFIG="${GADGET}/configs/c.1"
+
+ACTION="${1:-start}"
+
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+
+log() {
+    printf '[usb-gadget] %s\n' "$*"
+}
+
+warn() {
+    printf '[usb-gadget] WARNING: %s\n' "$*" >&2
+}
+
+die() {
+    printf '[usb-gadget] ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
+
+load_config() {
+
+    [[ -r "$CONFIG_FILE" ]] ||
+        die "Configuration file not found: $CONFIG_FILE"
+
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+
+    : "${PROFILE:=ecm}"
+
+    : "${ENABLE_ACM:=yes}"
+    : "${ENABLE_BOOT_STORAGE:=yes}"
+
+    : "${BOOT_STORAGE_DEVICE:=$DEFAULT_BOOT_STORAGE_DEVICE}"
+    : "${BOOT_STORAGE_MOUNT:=$DEFAULT_BOOT_STORAGE_MOUNT}"
+    : "${BOOT_STORAGE_RO:=no}"
+
+    : "${USB_ADDRESS:=192.168.2.3/24}"
+    : "${USB_GATEWAY:=192.168.2.2}"
+    : "${USB_DNS:=}"
+
+    : "${MANUFACTURER:=Kali Linux}"
+    : "${PRODUCT:=Raspberry Pi Zero 2 W}"
+
+    : "${ID_VENDOR:=0x1d6b}"
+    : "${ID_PRODUCT:=0x0104}"
+
+    : "${BCD_DEVICE:=0x0100}"
+    : "${BCD_USB:=0x0200}"
+
+    : "${MAX_POWER_MA:=250}"
+
+    case "$PROFILE" in
+        ecm|rndis)
+            ;;
+        *)
+            die "PROFILE must be 'ecm' or 'rndis'"
+            ;;
+    esac
+
+    case "$ENABLE_ACM" in
+        yes|no) ;;
+        *) die "ENABLE_ACM must be yes or no" ;;
+    esac
+
+    case "$ENABLE_BOOT_STORAGE" in
+        yes|no) ;;
+        *) die "ENABLE_BOOT_STORAGE must be yes or no" ;;
+    esac
+
+    case "$BOOT_STORAGE_RO" in
+        yes|no) ;;
+        *) die "BOOT_STORAGE_RO must be yes or no" ;;
+    esac
+}
+
+
+# ------------------------------------------------------------
+# Persistent identity
+# ------------------------------------------------------------
+
+generate_mac() {
+
+    local hex
+
+    hex="$(
+        od -An -N5 -tx1 /dev/urandom |
+        tr -d ' \n'
+    )"
+
+    #
+    # 02 = locally administered + unicast
+    #
+    printf '02:%s:%s:%s:%s:%s\n' \
+        "${hex:0:2}" \
+        "${hex:2:2}" \
+        "${hex:4:2}" \
+        "${hex:6:2}" \
+        "${hex:8:2}"
+}
+
+
+generate_serial() {
+
+    local serial=""
+
+    #
+    # Raspberry Pi hardware serial where available.
+    #
+    if [[ -r /proc/cpuinfo ]]; then
+        serial="$(
+            awk -F ':' '
+                /^[[:space:]]*Serial[[:space:]]*:/ {
+                    gsub(/[[:space:]]/, "", $2)
+                    print $2
+                    exit
+                }
+            ' /proc/cpuinfo
+        )"
+    fi
+
+    #
+    # Fallback.
+    #
+    if [[ -z "$serial" && -r /etc/machine-id ]]; then
+        serial="$(tr -d '\n' < /etc/machine-id)"
+    fi
+
+    #
+    # Last-resort persistent value.
+    #
+    if [[ -z "$serial" ]]; then
+        serial="$(
+            od -An -N8 -tx1 /dev/urandom |
+            tr -d ' \n'
+        )"
+    fi
+
+    printf '%s\n' "$serial"
+}
+
+
+load_or_create_identity() {
+
+    install -d -m 700 "$STATE_DIR"
+
+    if [[ ! -f "$IDENTITY_FILE" ]]; then
+
+        log "Generating persistent USB identity"
+
+        local host_mac
+        local dev_mac
+        local serial
+
+        host_mac="$(generate_mac)"
+
+        while :; do
+            dev_mac="$(generate_mac)"
+
+            [[ "$dev_mac" != "$host_mac" ]] &&
+                break
+        done
+
+        serial="$(generate_serial)"
+
+        umask 077
+
+        cat > "$IDENTITY_FILE" <<EOF
+HOST_MAC=${host_mac}
+DEV_MAC=${dev_mac}
+SERIAL=${serial}
+EOF
+
+        chmod 600 "$IDENTITY_FILE"
+
+        log "Identity saved to $IDENTITY_FILE"
+    fi
+
+    # shellcheck source=/dev/null
+    source "$IDENTITY_FILE"
+
+    [[ -n "${HOST_MAC:-}" ]] ||
+        die "HOST_MAC missing from identity file"
+
+    [[ -n "${DEV_MAC:-}" ]] ||
+        die "DEV_MAC missing from identity file"
+
+    [[ -n "${SERIAL:-}" ]] ||
+        die "SERIAL missing from identity file"
+}
+
+
+# ------------------------------------------------------------
+# ConfigFS / UDC
+# ------------------------------------------------------------
+
+prepare_configfs() {
+
+    modprobe libcomposite
+
+    if ! mountpoint -q "$CONFIGFS"; then
+
+        log "Mounting ConfigFS"
+
+        mount -t configfs none "$CONFIGFS"
+    fi
+
+    [[ -d "$GADGET_ROOT" ]] ||
+        die "USB Gadget ConfigFS interface unavailable"
+
+    UDC="$(
+        find /sys/class/udc \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -printf '%f\n' 2>/dev/null |
+        head -n1
+    )"
+
+    [[ -n "${UDC:-}" ]] ||
+        die "No USB Device Controller available"
+}
+
+
+# ------------------------------------------------------------
+# NetworkManager
+# ------------------------------------------------------------
+
+set_nm_unmanaged() {
+
+    local iface="$1"
+
+    if command -v nmcli >/dev/null 2>&1; then
+
+        nmcli device set "$iface" managed no \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+
+set_nm_managed() {
+
+    local iface="$1"
+
+    if command -v nmcli >/dev/null 2>&1; then
+
+        nmcli device set "$iface" managed yes \
+            >/dev/null 2>&1 || true
+    fi
+}
+
+
+# ------------------------------------------------------------
+# Boot partition handling
+# ------------------------------------------------------------
+
+boot_partition_is_mounted() {
+
+    local device="${BOOT_STORAGE_DEVICE:-$DEFAULT_BOOT_STORAGE_DEVICE}"
+
+    findmnt -rn -S "$device" >/dev/null 2>&1
+}
+
+
+unmount_boot_partition() {
+
+    [[ "${ENABLE_BOOT_STORAGE:-yes}" == yes ]] || return 0
+
+    local device="${BOOT_STORAGE_DEVICE:-$DEFAULT_BOOT_STORAGE_DEVICE}"
+
+    [[ -b "$device" ]] ||
+        die "Boot device is not a block device: $device"
+
+    sync
+
+    local attempt
+
+    for ((attempt = 1; attempt <= 10; attempt++)); do
+
+        local unmounted_any=no
+        local where
+
+        while IFS= read -r where; do
+
+            [[ -n "$where" ]] || continue
+
+            log "Unmounting boot partition from $where"
+
+            # A device can be mounted at more than one target.  Unmount
+            # every target and retry while systemd/udev finishes settling.
+            if umount "$where"; then
+                unmounted_any=yes
+            fi
+
+        done < <(
+            findmnt -rn \
+                -S "$device" \
+                -o TARGET |
+            sort -u
+        )
+
+        if ! boot_partition_is_mounted; then
+            return 0
+        fi
+
+        [[ "$unmounted_any" == yes ]] || break
+
+        sleep 0.2
+    done
+
+    die "$device is still mounted"
+}
+
+
+mount_boot_partition() {
+
+    [[ "${ENABLE_BOOT_STORAGE:-yes}" == yes ]] || return 0
+
+    local device="${BOOT_STORAGE_DEVICE:-$DEFAULT_BOOT_STORAGE_DEVICE}"
+    local mount_target="${BOOT_STORAGE_MOUNT:-$DEFAULT_BOOT_STORAGE_MOUNT}"
+
+    [[ -b "$device" ]] || return 0
+
+    if boot_partition_is_mounted; then
+        return 0
+    fi
+
+    log "Remounting boot partition"
+
+    #
+    # Prefer fstab.
+    #
+    if mount "$mount_target" 2>/dev/null; then
+        return 0
+    fi
+
+    #
+    # Fallback if fstab mount-by-target did not work.
+    #
+    install -d -m 755 "$mount_target"
+
+    if ! mount "$device" "$mount_target"; then
+        warn "Unable to remount $device"
+    fi
+}
+
+
+# ------------------------------------------------------------
+# Gadget teardown
+# ------------------------------------------------------------
+
+unbind_gadget() {
+
+    [[ -d "$GADGET" ]] || return 0
+
+    if [[ -f "$GADGET/UDC" ]]; then
+
+        local bound
+
+        bound="$(cat "$GADGET/UDC" 2>/dev/null || true)"
+
+        if [[ -n "$bound" ]]; then
+            log "Unbinding gadget from UDC"
+            printf '' > "$GADGET/UDC"
+            sleep 0.2
+        fi
+    fi
+}
+
+
+disconnect_mass_storage() {
+
+    local lun="${GADGET}/functions/mass_storage.boot/lun.0"
+
+    [[ -d "$lun" ]] || return 0
+
+    if [[ -f "$lun/file" ]]; then
+
+        log "Disconnecting boot partition from USB Mass Storage"
+
+        printf '' > "$lun/file" 2>/dev/null || true
+    fi
+}
+
+
+cleanup_gadget() {
+
+    [[ -d "$GADGET" ]] || return 0
+
+    log "Cleaning existing ConfigFS gadget"
+
+    unbind_gadget
+
+    disconnect_mass_storage
+
+    #
+    # Remove function -> configuration links.
+    #
+    if [[ -d "${GADGET}/configs" ]]; then
+
+        find "${GADGET}/configs" \
+            -type l \
+            -delete 2>/dev/null || true
+    fi
+
+    #
+    # Remove configuration strings.
+    #
+    if [[ -d "${CONFIG}/strings" ]]; then
+
+        find "${CONFIG}/strings" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -exec rmdir {} \; \
+            2>/dev/null || true
+    fi
+
+    #
+    # Remove configuration.
+    #
+    rmdir "$CONFIG" 2>/dev/null || true
+
+    #
+    # Remove functions.
+    #
+    if [[ -d "${GADGET}/functions" ]]; then
+
+        while IFS= read -r dir; do
+            rmdir "$dir" 2>/dev/null || true
+        done < <(
+            find "${GADGET}/functions" \
+                -mindepth 1 \
+                -maxdepth 1 \
+                -type d
+        )
+    fi
+
+    #
+    # Remove gadget strings.
+    #
+    if [[ -d "${GADGET}/strings" ]]; then
+
+        find "${GADGET}/strings" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -exec rmdir {} \; \
+            2>/dev/null || true
+    fi
+
+    #
+    # Finally remove gadget itself.
+    #
+    if ! rmdir "$GADGET" 2>/dev/null; then
+        die "Unable to remove ConfigFS gadget completely"
+    fi
+}
+
+
+# ------------------------------------------------------------
+# Base gadget
+# ------------------------------------------------------------
+
+create_base_gadget() {
+
+    log "Creating ConfigFS gadget"
+
+    mkdir "$GADGET"
+
+    cd "$GADGET"
+
+    printf '%s\n' "$ID_VENDOR"  > idVendor
+    printf '%s\n' "$ID_PRODUCT" > idProduct
+
+    printf '%s\n' "$BCD_DEVICE" > bcdDevice
+    printf '%s\n' "$BCD_USB"    > bcdUSB
+
+    mkdir -p strings/0x409
+
+    printf '%s\n' "$SERIAL" \
+        > strings/0x409/serialnumber
+
+    printf '%s\n' "$MANUFACTURER" \
+        > strings/0x409/manufacturer
+
+    printf '%s\n' "$PRODUCT" \
+        > strings/0x409/product
+
+    mkdir -p configs/c.1/strings/0x409
+
+    #
+    # ConfigFS MaxPower uses units of 2 mA.
+    #
+    printf '%d\n' "$(( (MAX_POWER_MA + 1) / 2 ))" \
+        > configs/c.1/MaxPower
+}
+
+
+# ------------------------------------------------------------
+# Ethernet
+# ------------------------------------------------------------
+
+create_ecm() {
+
+    log "Adding CDC ECM Ethernet"
+
+    local func="${GADGET}/functions/ecm.usb0"
+
+    mkdir "$func"
+
+    printf '%s\n' "$HOST_MAC" > "$func/host_addr"
+    printf '%s\n' "$DEV_MAC"  > "$func/dev_addr"
+
+    #
+    # Request predictable Linux interface naming.
+    #
+    if [[ -w "$func/ifname" ]]; then
+        printf 'usb%%d\n' > "$func/ifname"
+    fi
+
+    ln -s "$func" "$CONFIG/ecm.usb0"
+
+    NETWORK_FUNCTION="$func"
+
+    printf '%s\n' \
+        "CDC ECM Ethernet + ACM + Boot Storage" \
+        > "$CONFIG/strings/0x409/configuration"
+}
+
+
+create_rndis() {
+
+    log "Adding RNDIS Ethernet"
+
+    local func="${GADGET}/functions/rndis.usb0"
+
+    mkdir "$func"
+
+    printf '%s\n' "$HOST_MAC" > "$func/host_addr"
+    printf '%s\n' "$DEV_MAC"  > "$func/dev_addr"
+
+    if [[ -w "$func/ifname" ]]; then
+        printf 'usb%%d\n' > "$func/ifname"
+    fi
+
+    #
+    # Put RNDIS first in the configuration.
+    # This is preferable for Windows composite gadgets.
+    #
+    ln -s "$func" "$CONFIG/rndis.usb0"
+
+    NETWORK_FUNCTION="$func"
+
+    printf '%s\n' \
+        "RNDIS Ethernet + ACM + Boot Storage" \
+        > "$CONFIG/strings/0x409/configuration"
+}
+
+# ------------------------------------------------------------
+# CDC ACM serial
+# ------------------------------------------------------------
+
+create_acm() {
+
+    [[ "$ENABLE_ACM" == yes ]] || return 0
+
+    log "Adding CDC ACM serial"
+
+    local func="${GADGET}/functions/acm.usb0"
+
+    mkdir "$func"
+
+    ln -s "$func" "$CONFIG/acm.usb0"
+}
+
+
+# ------------------------------------------------------------
+# USB Mass Storage -> REAL boot partition
+# ------------------------------------------------------------
+
+create_boot_storage() {
+
+    [[ "$ENABLE_BOOT_STORAGE" == yes ]] || return 0
+
+    [[ -b "$BOOT_STORAGE_DEVICE" ]] ||
+        die "Boot storage device not found: $BOOT_STORAGE_DEVICE"
+
+    boot_partition_is_mounted &&
+        die "$BOOT_STORAGE_DEVICE must be unmounted before USB export"
+
+    log "Adding USB Mass Storage: $BOOT_STORAGE_DEVICE"
+
+    local func="${GADGET}/functions/mass_storage.boot"
+    local lun="${func}/lun.0"
+
+    mkdir "$func"
+
+    #
+    # USB Mass Storage settings.
+    #
+    echo 1 > "$func/stall"
+
+    echo 1 > "$lun/removable"
+    echo 0 > "$lun/cdrom"
+
+    if [[ "$BOOT_STORAGE_RO" == yes ]]; then
+        echo 1 > "$lun/ro"
+    else
+        echo 0 > "$lun/ro"
+    fi
+
+    #
+    # Real SD-card boot partition.
+    #
+    printf '%s\n' "$BOOT_STORAGE_DEVICE" > "$lun/file"
+
+    ln -s "$func" "$CONFIG/mass_storage.boot"
+}
+
+
+# ------------------------------------------------------------
+# Bind
+# ------------------------------------------------------------
+
+bind_gadget() {
+
+    log "Binding gadget to UDC: $UDC"
+
+    printf '%s\n' "$UDC" > "$GADGET/UDC"
+}
+
+
+# ------------------------------------------------------------
+# Network interface setup
+# ------------------------------------------------------------
+
+find_network_interface() {
+
+    local iface=""
+
+    for _ in $(seq 1 50); do
+
+        if [[ -r "${NETWORK_FUNCTION}/ifname" ]]; then
+            iface="$(cat "${NETWORK_FUNCTION}/ifname")"
+        fi
+
+        if [[ -n "$iface" ]] &&
+           ip link show "$iface" >/dev/null 2>&1; then
+
+            printf '%s\n' "$iface"
+            return 0
+        fi
+
+        sleep 0.1
+    done
+
+    return 1
+}
+
+
+configure_network() {
+
+    local iface
+
+    iface="$(find_network_interface)" ||
+        die "USB Ethernet interface did not appear"
+
+    log "USB Ethernet interface: $iface"
+
+    set_nm_unmanaged "$iface"
+
+    ip link set "$iface" down
+
+    ip -4 addr flush dev "$iface"
+
+    ip -4 addr add "$USB_ADDRESS" dev "$iface"
+
+    ip link set "$iface" up
+
+    log "Configuring default route via $USB_GATEWAY"
+
+    ip route replace default via "$USB_GATEWAY" dev "$iface"
+
+    if [[ -n "${USB_DNS:-}" ]]; then
+        configure_dns
+    else
+        log "Leaving existing DNS configuration unchanged"
+    fi
+
+    NETWORK_INTERFACE="$iface"
+
+    printf '%s\n' "$iface" > "${STATE_DIR}/network-interface"
+}
+
+
+configure_dns() {
+
+    local dns_server
+    local temporary
+    local -a dns_servers
+
+    read -r -a dns_servers <<< "$USB_DNS"
+
+    ((${#dns_servers[@]} > 0)) ||
+        die "USB_DNS must contain at least one DNS server when set"
+
+    log "Configuring DNS: ${dns_servers[*]}"
+
+    if [[ ! -e "$RESOLV_BACKUP" && -L "$RESOLV_CONF" ]] ||
+       [[ ! -e "$RESOLV_BACKUP" && -f "$RESOLV_CONF" ]]; then
+        cp -a "$RESOLV_CONF" "$RESOLV_BACKUP"
+    elif [[ ! -e "$RESOLV_BACKUP" && ! -L "$RESOLV_CONF" ]]; then
+        : > "$RESOLV_CREATED"
+    fi
+
+    temporary="$(mktemp /etc/resolv.conf.usb-gadget.XXXXXX)"
+
+    {
+        printf '# Managed by usb-gadget while the USB link is active.\n'
+
+        for dns_server in "${dns_servers[@]}"; do
+            printf 'nameserver %s\n' "$dns_server"
+        done
+    } > "$temporary"
+
+    rm -f "$RESOLV_CONF"
+    mv "$temporary" "$RESOLV_CONF"
+}
+
+
+restore_dns_configuration() {
+
+    if [[ -e "$RESOLV_BACKUP" || -L "$RESOLV_BACKUP" ]]; then
+        rm -f "$RESOLV_CONF"
+        mv "$RESOLV_BACKUP" "$RESOLV_CONF"
+    elif [[ -e "$RESOLV_CREATED" ]]; then
+        rm -f "$RESOLV_CONF" "$RESOLV_CREATED"
+    fi
+}
+
+
+# ------------------------------------------------------------
+# START
+# ------------------------------------------------------------
+
+start_gadget() {
+
+    load_config
+
+    load_or_create_identity
+
+    prepare_configfs
+
+    #
+    # g_ether and ConfigFS must never compete for the UDC.
+    #
+    if lsmod | grep -q '^g_ether '; then
+
+        die \
+        "g_ether is loaded. Remove g_ether from cmdline.txt and reboot."
+    fi
+
+    #
+    # Remove stale ConfigFS state from a previous failed start.
+    #
+    cleanup_gadget
+
+    #
+    # The real boot filesystem must not remain mounted while
+    # another OS gets raw block-level access to it.
+    #
+    unmount_boot_partition
+
+    create_base_gadget
+
+    case "$PROFILE" in
+
+        ecm)
+            create_ecm
+            ;;
+
+        rndis)
+            create_rndis
+            ;;
+
+    esac
+
+    create_acm
+
+    create_boot_storage
+
+    bind_gadget
+
+    configure_network
+
+    log "USB gadget started successfully"
+    log "Profile       : $PROFILE"
+    log "Host MAC      : $HOST_MAC"
+    log "Device MAC    : $DEV_MAC"
+    log "Device IP     : $USB_ADDRESS"
+
+    if [[ "$ENABLE_ACM" == yes ]]; then
+        log "Serial device : /dev/ttyGS0"
+    fi
+
+    if [[ "$ENABLE_BOOT_STORAGE" == yes ]]; then
+        log "Boot storage  : $BOOT_STORAGE_DEVICE"
+    fi
+}
+
+
+# ------------------------------------------------------------
+# STOP
+# ------------------------------------------------------------
+
+stop_gadget() {
+
+    prepare_configfs
+
+    local old_iface=""
+    local boot_device=""
+
+    if [[ -r "${STATE_DIR}/network-interface" ]]; then
+        old_iface="$(cat "${STATE_DIR}/network-interface")"
+    fi
+
+    if [[ -r "${GADGET}/functions/mass_storage.boot/lun.0/file" ]]; then
+        boot_device="$(
+            cat "${GADGET}/functions/mass_storage.boot/lun.0/file"
+        )"
+    fi
+
+    unbind_gadget
+
+    disconnect_mass_storage
+
+    cleanup_gadget
+
+    if [[ -n "$old_iface" ]]; then
+        set_nm_managed "$old_iface"
+    fi
+
+    rm -f "${STATE_DIR}/network-interface"
+
+    restore_dns_configuration
+
+    if [[ -n "$boot_device" ]]; then
+        BOOT_STORAGE_DEVICE="$boot_device"
+        ENABLE_BOOT_STORAGE=yes
+        mount_boot_partition
+    fi
+
+    log "USB gadget stopped"
+}
+
+
+# ------------------------------------------------------------
+# STATUS
+# ------------------------------------------------------------
+
+status_gadget() {
+
+    load_config
+
+    printf 'Configuration\n'
+    printf '  Profile:        %s\n' "$PROFILE"
+    printf '  ACM:            %s\n' "$ENABLE_ACM"
+    printf '  Boot Storage:   %s\n' "$ENABLE_BOOT_STORAGE"
+    printf '  Boot Device:    %s\n' "$BOOT_STORAGE_DEVICE"
+    printf '  Device IP:      %s\n' "$USB_ADDRESS"
+
+    printf '\nIdentity\n'
+
+    if [[ -r "$IDENTITY_FILE" ]]; then
+
+        # shellcheck source=/dev/null
+        source "$IDENTITY_FILE"
+
+        printf '  Host MAC:       %s\n' "$HOST_MAC"
+        printf '  Device MAC:     %s\n' "$DEV_MAC"
+        printf '  Serial:         %s\n' "$SERIAL"
+
+    else
+
+        printf '  Not generated yet\n'
+    fi
+
+    printf '\nRuntime\n'
+
+    if [[ -d "$GADGET" ]]; then
+
+        printf '  Gadget:         active\n'
+
+        if [[ -r "$GADGET/UDC" ]]; then
+            printf '  UDC:            %s\n' \
+                "$(cat "$GADGET/UDC")"
+        fi
+
+    else
+
+        printf '  Gadget:         inactive\n'
+    fi
+
+    if [[ -r "${STATE_DIR}/network-interface" ]]; then
+
+        local iface
+
+        iface="$(cat "${STATE_DIR}/network-interface")"
+
+        printf '  Interface:      %s\n' "$iface"
+
+        ip -br address show "$iface" 2>/dev/null || true
+    fi
+
+    if boot_partition_is_mounted; then
+
+        printf '  Boot mounted:   yes\n'
+
+    else
+
+        printf '  Boot mounted:   no\n'
+    fi
+
+    if [[ -d "${GADGET}/functions/mass_storage.boot/lun.0" ]]; then
+
+        local backing
+
+        backing="$(
+            cat "${GADGET}/functions/mass_storage.boot/lun.0/file" \
+                2>/dev/null || true
+        )"
+
+        printf '  USB storage:    %s\n' \
+            "${backing:-disconnected}"
+    fi
+}
+
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+case "$ACTION" in
+
+    start)
+
+        start_gadget
+        ;;
+
+    stop)
+
+        stop_gadget
+        ;;
+
+    restart)
+
+        stop_gadget
+        start_gadget
+        ;;
+
+    status)
+
+        status_gadget
+        ;;
+
+    *)
+
+        printf \
+            'Usage: %s {start|stop|restart|status}\n' \
+            "$0" >&2
+
+        exit 2
+        ;;
+
+esac

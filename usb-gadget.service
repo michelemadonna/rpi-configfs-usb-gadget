@@ -1,0 +1,20 @@
+[Unit]
+Description=Raspberry Pi ConfigFS USB Composite Gadget
+
+After=systemd-modules-load.service local-fs.target
+Wants=network-pre.target
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+
+ExecStart=/usr/local/sbin/usb-gadget start
+ExecStop=/usr/local/sbin/usb-gadget stop
+
+RemainAfterExit=yes
+
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

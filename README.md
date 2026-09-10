@@ -1,13 +1,23 @@
-# Raspberry Pi Zero 2 W USB Gadget / Host Mode
+# Raspberry Pi Zero 2 W ConfigFS USB Gadget
 
-This package configures the Pi Zero 2 W OTG controller in one of two mutually exclusive modes:
+This package configures the Raspberry Pi Zero 2 W as a USB gadget through
+Linux ConfigFS. It supports:
 
-- `USB_MODE=gadget`: the Pi acts as a USB peripheral toward macOS/Linux/Windows.
-- `USB_MODE=host`: the Pi acts as a USB host for external USB devices such as Wi-Fi dongles or hubs.
+- CDC ECM Ethernet for macOS and Linux;
+- RNDIS Ethernet for Windows;
+- optional CDC ACM serial;
+- optional export of the real FAT boot partition as USB Mass Storage;
+- persistent USB MAC addresses and serial identity;
+- an optional USB gateway and optional USB DNS configuration.
+- tested on Raspberry Pi OS 64-bit (Trixie) and Kali/Kali PiTails 64-bit (2026.2)
 
-The same OTG controller cannot be host and gadget at the same time.
+The package uses the existing `ifupdown` boot flow. On the first boot,
+an `up` hook attached to `lo` installs the runtime files into the real root
+filesystem and starts the service. The hook is then removed automatically.
 
-## Files to copy to the boot partition
+## Package files
+
+Copy these files to the root of the FAT boot partition:
 
 ```text
 install-usb-gadget.sh
@@ -16,215 +26,107 @@ usb-gadget.service
 usb-gadget.conf
 ```
 
-`usb-gadget.conf` stays on the boot partition and is the configuration source of truth.
+`usb-gadget.conf` intentionally remains on the boot partition. It is the
+runtime configuration source and is not copied into `/etc`.
 
-## Gadget mode: macOS/Linux
+## Clean installation
 
-```bash
-USB_MODE=gadget
-PROFILE=ecm
-```
+This procedure starts from a freshly flashed RPI linux distro SD card and does not
+require SSH access or a previous gadget installation.
 
-This can expose:
+### 1. Copy the package to the boot partition
 
-- CDC ECM Ethernet
-- optional CDC ACM serial
-- optional real boot partition as USB Mass Storage
-- persistent MAC addresses
-- static IPv4 on the Pi USB interface
-
-## Gadget mode: Windows
+Mount the SD card's FAT boot partition on the host machine. In this example it is
+`/Volumes/bootfs` for macOS. Adjust the path for Linux or Windows.
 
 ```bash
-USB_MODE=gadget
-PROFILE=rndis
+BOOT=/Volumes/bootfs
+
+cp ./install-usb-gadget.sh "$BOOT/install-usb-gadget.sh"
+cp ./usb-gadget "$BOOT/usb-gadget"
+cp ./usb-gadget.service "$BOOT/usb-gadget.service"
+cp ./usb-gadget.conf "$BOOT/usb-gadget.conf"
 ```
 
-## USB host mode
+### 2. Remove legacy gadget boot parameters
+
+Edit `cmdline.txt` and keep it as one line:
 
 ```bash
-USB_MODE=host
+nano "$BOOT/cmdline.txt"
 ```
 
-The installer configures the Device Tree overlay in `config.txt`:
+Remove old tokens if exists such as:
 
 ```text
-dtoverlay=dwc2,dr_mode=host
+g_ether
+g_ether.host_addr=...
+g_ether.dev_addr=...
 ```
 
-In gadget mode it uses:
+If `modules-load=` contains `g_ether`, remove only that module and leave
+`dwc2`, for example:
 
 ```text
-dtoverlay=dwc2,dr_mode=peripheral
+modules-load=dwc2
 ```
 
-A reboot is required when switching roles.
+### 3. Add the first-boot ifupdown hook
 
-## Offline installation from macOS
+Edit the boot-side `interfaces` file:
 
-Copy all four package files to the Raspberry Pi boot partition.
+```bash
+nano "$BOOT/interfaces"
+```
 
-Append the following arguments to the single line in `cmdline.txt`:
+Ensure the loopback stanza contains this line exactly once:
 
 ```text
-systemd.run="/bin/bash /boot/firmware/install-usb-gadget.sh --offline-firstboot" systemd.run_success_action=none systemd.run_failure_action=none
+auto lo
+iface lo inet loopback
+    up /bin/bash /boot/firmware/install-usb-gadget.sh --offline-firstboot || true
 ```
 
-If your distribution mounts the boot partition at `/boot`, use `/boot/install-usb-gadget.sh`.
+Do not add a second `usb0` network stanza. The runtime script creates and
+configures the USB Ethernet interface itself. RPI copies the boot-side
+`interfaces` file into `/etc/network/interfaces` during boot.
 
-Then eject the boot volume cleanly and boot the Pi.
+### 4. First boot
 
-The first boot:
+Eject the SD card cleanly, insert it into the Pi, and connect the USB data port
+to the host computer.
 
-1. validates the package,
-2. backs up `cmdline.txt` and `config.txt`,
-3. removes legacy `g_ether` parameters,
-4. ensures `modules-load=dwc2`,
-5. sets the selected OTG role in `config.txt`,
-6. installs `/usr/local/sbin/usb-gadget`,
-7. installs/enables `usb-gadget.service`,
-8. removes temporary `systemd.run=...` parameters,
-9. reboots.
-
-The selected USB mode becomes active on the second boot.
-
-## Normal installation from Linux
-
-```bash
-sudo ./install-usb-gadget.sh
-sudo reboot
-```
-
-## Switching between gadget and host later
-
-Edit `usb-gadget.conf` on the boot partition.
-
-For USB host:
-
-```bash
-USB_MODE=host
-```
-
-Then:
-
-```bash
-sudo /boot/firmware/install-usb-gadget.sh
-sudo reboot
-```
-
-To return to ECM gadget mode:
-
-```bash
-USB_MODE=gadget
-PROFILE=ecm
-```
-
-Then rerun the installer and reboot.
-
-## Persistent MAC addresses
-
-On the first successful gadget start:
+The first boot performs this sequence:
 
 ```text
-/var/lib/usb-gadget/identity.conf
+RPI copies boot/interfaces
+        |
+        |
+        v
+ifup lo
+        |
+        v
+install-usb-gadget.sh --offline-firstboot
+        |
+        +-- re-executes from /run so /boot/firmware can be unmounted safely
+        +-- installs usb-gadget into /usr/local/sbin
+        +-- installs usb-gadget.service into /etc/systemd/system
+        +-- removes the first-boot hook from boot/interfaces
+        +-- systemctl daemon-reload
+        +-- systemctl enable usb-gadget.service
+        +-- systemctl start usb-gadget.service
+        +-- creates /var/lib/usb-gadget/.offline-firstboot-installed
 ```
 
-is created. The same MAC addresses are reused after reboot.
-
-## Boot partition export safety
-
-When `ENABLE_BOOT_STORAGE=yes`, the boot filesystem is unmounted locally before its raw block device is exposed over USB.
-
-Never mount the same filesystem read/write on the Pi and the USB host simultaneously.
-
-Always eject the boot volume cleanly from macOS before rebooting the Pi.
-
-## Useful commands
-
-```bash
-sudo /boot/firmware/install-usb-gadget.sh --check
-sudo systemctl status usb-gadget
-sudo /usr/local/sbin/usb-gadget status
-```
-       └── real boot partition
-           /dev/mmcblk0p1
-```
-
-For Windows, change the Ethernet profile from ECM to RNDIS.
-
-## Requirements
-
-The kernel must support the following options:
-
-```text
-CONFIG_USB_LIBCOMPOSITE
-CONFIG_USB_CONFIGFS
-CONFIG_USB_CONFIGFS_ECM
-CONFIG_USB_CONFIGFS_RNDIS
-CONFIG_USB_CONFIGFS_ACM
-CONFIG_USB_CONFIGFS_MASS_STORAGE
-```
-
-On Kali/Raspberry Pi kernels these can be checked with:
-
-```bash
-grep -E 'CONFIG_USB_(LIBCOMPOSITE|CONFIGFS|CONFIGFS_ECM|CONFIGFS_RNDIS|CONFIGFS_ACM|CONFIGFS_MASS_STORAGE)' \
-    /boot/config-$(uname -r)
-```
-
-The Raspberry Pi USB controller must be running in device/gadget mode through `dwc2`.
-
-## Installation
-
-Copy the installer to the Raspberry Pi and run:
-
-```bash
-chmod +x install-usb-gadget.sh
-sudo ./install-usb-gadget.sh
-```
-
-The installer:
-
-1. Detects `cmdline.txt`.
-2. Creates a timestamped backup of it.
-3. Removes legacy `g_ether` parameters.
-4. Configures `modules-load=dwc2`.
-5. Checks ConfigFS/libcomposite support.
-6. Detects the boot partition and its mount point where possible.
-7. Installs `/usr/local/sbin/usb-gadget`.
-8. Creates `/etc/usb-gadget/gadget.conf` if it does not already exist.
-9. Installs and enables `usb-gadget.service`.
-10. Leaves the system ready for a reboot.
-
-Then reboot:
-
-```bash
-sudo reboot
-```
-
-After reboot:
-
-```bash
-sudo usb-gadget status
-```
-
-or:
-
-```bash
-systemctl status usb-gadget.service
-```
+The service is started during this same first boot. No intermediate reboot is
+required by the bootstrap.
 
 ## Configuration
 
-The main configuration file is:
-
-```text
-/etc/usb-gadget/gadget.conf
-```
-
-Default configuration:
+The main in `usb-gadget.conf` are:
 
 ```bash
+# ecm for macOS/Linux, rndis for Windows
 PROFILE=ecm
 
 ENABLE_ACM=yes
@@ -235,326 +137,200 @@ BOOT_STORAGE_MOUNT=/boot/firmware
 BOOT_STORAGE_RO=no
 
 USB_ADDRESS=192.168.2.3/24
+USB_GATEWAY=192.168.2.1
 
-MANUFACTURER="Kali Linux"
-PRODUCT="Raspberry Pi Zero 2 W"
-
-ID_VENDOR=0x1d6b
-ID_PRODUCT=0x0104
-BCD_DEVICE=0x0100
-BCD_USB=0x0200
-MAX_POWER_MA=250
+# Optional. Leave empty to preserve the existing DNS configuration.
+USB_DNS=
 ```
 
-Verify the boot partition before relying on the defaults:
+`USB_GATEWAY` must be the address of the host computer on the USB network.
+If the host uses Internet Sharing, enable it on the host and set this value to
+the host's shared-interface address. The gadget replaces the default route
+with:
+
+```text
+default via USB_GATEWAY dev usb0
+```
+
+`USB_DNS` is optional and has no assumed default. If it is set, it may contain
+space-separated DNS servers, for example:
 
 ```bash
-lsblk -f
-findmnt /boot
-findmnt /boot/firmware
+USB_DNS=1.1.1.1
 ```
 
-## Persistent MAC addresses
+If it is empty, the script does not modify the existing DNS configuration.
 
-On the first successful start, the runtime script generates two locally administered unicast MAC addresses and stores them in:
+The service reads `usb-gadget.conf` when it starts. After changing it, restart
+the service when the boot partition is available to the Pi:
+
+```bash
+sudo systemctl restart usb-gadget.service
+```
+
+When `ENABLE_BOOT_STORAGE=yes`, the service unmounts the boot filesystem and
+exports its raw block device over USB. In that state, edit the file from the
+host's mounted USB storage, eject it cleanly, and then restart the service or
+reboot the Pi.
+
+## Host configuration
+
+Configure the host USB Ethernet interface with an address in the same subnet
+as `USB_ADDRESS`. For example, if the Pi is `192.168.2.3/24` and the host is
+`192.168.2.2`, use:
+
+```text
+Host address: 192.168.2.2
+Subnet mask:  255.255.255.0
+```
+
+The host address must match `USB_GATEWAY` if the Pi should use the USB link for
+its default route.
+
+For SSH:
+
+```bash
+ssh kali@192.168.2.3
+```
+
+Keep the normal host Wi-Fi or Ethernet service configured separately if it is
+also providing Internet Sharing.
+
+### Connect via USB on MacOS
+
+1. First boot the Pi with the SD card inserted and the USB cable disconnected. 
+   The Pi will boot normally and run the first-boot hook. 
+   The Pi will power from the Mac and expose itself as a USB Ethernet (RNDIS/Ethernet Gadget) network interface, and a yellow dot will appear next to the new USB network interface in macOS Network settings to indicate limited or no internet connectivity.
+   
+     ![1.png](static/1.png)
+
+2. Configure macOS networking
+   Once the Pi has booted in gadget mode:
+   Open **System Preferences** > **Network**. A new **RNDIS/Ethernet Gadget** interface should appear.
+   
+   Click **Details** and configure:
+   
+   - **TCP/IP Tab:**
+     
+     - Configure IPv4: **Manually**
+     
+     - IP Address: `192.168.2.2`
+     
+     - Subnet Mask: `255.255.255.0`
+     
+     - Router: `192.168.2.1`
+       
+       ![2.png](static/2.png)
+   
+   - **DNS Tab:**
+     
+     - DNS Servers: `192.168.2.1` or `1.1.1.1`
+       
+       ![3.png](static/3.png)
+   
+   Now the RNDIS/Ethernet Gadget will appears as connected (green dot)
+   
+   ![4.png](static/4.png)
+
+3. **Enable Internet Sharing** (Optional) If you want the Pi to have internet access through your Mac, enable **Internet Sharing** in **System Preferences** > **Sharing**. Share your Wi-Fi or Ethernet connection to the **RNDIS/Ethernet Gadget** interface.
+
+4. **Set Network Service Order** Ensure your network service order has **Wi-Fi** or **Ethernet** listed **above** the **RNDIS/Ethernet Gadget** connection. You can adjust this in **System Preferences** > **Network** > **...** > **Set Service Order**.
+
+After configuration, you should be able to SSH to your Pi at `192.168.2.3`.
+
+## Runtime commands
+
+```bash
+sudo systemctl status usb-gadget.service
+sudo journalctl -u usb-gadget.service --no-pager
+sudo systemctl restart usb-gadget.service
+sudo systemctl stop usb-gadget.service
+```
+
+To check the selected route on the Pi:
+
+```bash
+ip -br address
+ip route
+ip route get 8.8.8.8
+```
+
+The last command should select the USB interface and `USB_GATEWAY`.
+
+The persistent identity is stored at:
 
 ```text
 /var/lib/usb-gadget/identity.conf
 ```
 
-Example:
+Do not delete it during normal maintenance. Removing it intentionally causes
+new USB MAC addresses and a new serial identity to be generated.
+
+## Boot partition export safety
+
+When `ENABLE_BOOT_STORAGE=yes`, the boot filesystem must not be mounted
+read/write simultaneously by the Pi and the USB host. Always eject the boot
+volume cleanly from macOS or Linux before rebooting the Pi.
+
+Set:
+
+```bash
+ENABLE_BOOT_STORAGE=no
+```
+
+if the host must not receive the boot partition as USB Mass Storage.
+
+## Recovering from an incomplete first boot
+
+If the service failed before completing the first boot, inspect the installer
+directly:
+
+```bash
+sudo bash -x /boot/firmware/install-usb-gadget.sh --offline-firstboot
+```
+
+Check the required boot files:
+
+```bash
+sudo ls -l /boot/firmware/{install-usb-gadget.sh,usb-gadget,usb-gadget.service,usb-gadget.conf}
+```
+
+Check the first-boot hook:
+
+```bash
+sudo grep -n 'install-usb-gadget' \
+    /boot/firmware/interfaces \
+    /etc/network/interfaces
+```
+
+The one-shot marker is:
 
 ```text
-HOST_MAC=02:43:c8:82:b1:10
-DEV_MAC=02:55:32:77:bc:a2
-SERIAL=000000001234abcd
+/var/lib/usb-gadget/.offline-firstboot-installed
 ```
 
-These values survive reboots and profile changes.
+It is created only after the service has started successfully.
 
-To deliberately create a new USB identity:
+## Requirements
 
-```bash
-sudo systemctl stop usb-gadget
-sudo rm /var/lib/usb-gadget/identity.conf
-sudo systemctl start usb-gadget
-```
-
-Do not delete this file during normal upgrades or reboots if you want macOS/Windows to continue seeing the same Ethernet device.
-
-## macOS / Linux profile
-
-Use:
-
-```bash
-PROFILE=ecm
-```
-
-Restart the gadget after changing the profile:
-
-```bash
-sudo systemctl restart usb-gadget
-```
-
-The Raspberry Pi receives:
+The kernel must provide ConfigFS USB gadget support, including the functions
+used by the selected configuration:
 
 ```text
-192.168.2.3/24
+CONFIG_USB_LIBCOMPOSITE
+CONFIG_USB_CONFIGFS
+CONFIG_USB_CONFIGFS_ECM
+CONFIG_USB_CONFIGFS_RNDIS
+CONFIG_USB_CONFIGFS_ACM
+CONFIG_USB_CONFIGFS_MASS_STORAGE
 ```
 
-No default route is added through USB, so Wi-Fi can remain the normal Internet/default route.
-
-On macOS, identify the new Ethernet interface:
+Check the running kernel with:
 
 ```bash
-networksetup -listallhardwareports
+grep -E 'CONFIG_USB_(LIBCOMPOSITE|CONFIGFS|CONFIGFS_ECM|CONFIGFS_RNDIS|CONFIGFS_ACM|CONFIGFS_MASS_STORAGE)' \
+    /boot/config-$(uname -r)
 ```
 
-For a direct static test, assuming the interface is `en6`:
-
-```bash
-sudo ifconfig en6 inet 192.168.2.1 netmask 255.255.255.0 up
-ping 192.168.2.3
-```
-
-From the Raspberry Pi:
-
-```bash
-ping 192.168.2.1
-```
-
-## Windows profile
-
-Edit:
-
-```text
-/etc/usb-gadget/gadget.conf
-```
-
-and change:
-
-```bash
-PROFILE=rndis
-```
-
-Then restart:
-
-```bash
-sudo systemctl restart usb-gadget
-```
-
-ECM and RNDIS are intentionally implemented as alternative profiles rather than exposing both Ethernet functions simultaneously. This keeps host behavior deterministic.
-
-## CDC ACM serial
-
-With:
-
-```bash
-ENABLE_ACM=yes
-```
-
-the Raspberry Pi exposes:
-
-```text
-/dev/ttyGS0
-```
-
-On macOS the corresponding device normally appears as something similar to:
-
-```bash
-ls /dev/cu.usbmodem*
-```
-
-This provides a useful fallback management channel even if USB Ethernet is not working.
-
-## Boot partition as USB Mass Storage
-
-With:
-
-```bash
-ENABLE_BOOT_STORAGE=yes
-BOOT_STORAGE_DEVICE=/dev/mmcblk0p1
-BOOT_STORAGE_RO=no
-```
-
-the real boot partition is exposed directly to the USB host.
-
-Before creating the USB Mass Storage LUN, the runtime script:
-
-1. Calls `sync`.
-2. Detects whether the boot partition is mounted.
-3. Unmounts it from the Raspberry Pi.
-4. Verifies that it is no longer mounted.
-5. Exposes the block device through ConfigFS Mass Storage.
-
-When the gadget is stopped, the script removes the Mass Storage backing device and remounts the boot partition.
-
-### Important data-integrity rule
-
-Never mount the same filesystem read/write simultaneously on both the Raspberry Pi and the USB host.
-
-The script prevents the normal Raspberry Pi mount from remaining active while the partition is exported, but the host must still flush/eject the USB volume before rebooting or stopping the gadget.
-
-On macOS, eject the volume in Finder or use:
-
-```bash
-diskutil list
-diskutil eject /dev/diskX
-```
-
-Then reboot the Raspberry Pi if required.
-
-If you only need to inspect the boot partition from the host, set:
-
-```bash
-BOOT_STORAGE_RO=yes
-```
-
-## Service commands
-
-Start:
-
-```bash
-sudo systemctl start usb-gadget
-```
-
-Stop:
-
-```bash
-sudo systemctl stop usb-gadget
-```
-
-Restart:
-
-```bash
-sudo systemctl restart usb-gadget
-```
-
-Status:
-
-```bash
-sudo usb-gadget status
-```
-
-Logs:
-
-```bash
-journalctl -u usb-gadget.service -b
-```
-
-Follow logs live:
-
-```bash
-journalctl -fu usb-gadget.service
-```
-
-## Files installed
-
-```text
-/etc/usb-gadget/gadget.conf
-/usr/local/sbin/usb-gadget
-/etc/systemd/system/usb-gadget.service
-/var/lib/usb-gadget/identity.conf
-```
-
-The identity file is created only when the gadget starts for the first time.
-
-## Legacy `g_ether`
-
-Do not load `g_ether` together with this setup.
-
-The kernel command line should contain:
-
-```text
-modules-load=dwc2
-```
-
-and must not contain:
-
-```text
-g_ether
-g_ether.host_addr=...
-g_ether.dev_addr=...
-```
-
-`g_ether` and the ConfigFS gadget would otherwise compete for the same USB Device Controller.
-
-## Troubleshooting
-
-### Check the USB Device Controller
-
-```bash
-ls /sys/class/udc
-```
-
-A Pi Zero 2 W typically shows an entry corresponding to the `dwc2` controller.
-
-### Check loaded modules
-
-```bash
-lsmod | grep -E 'dwc2|libcomposite|usb_f_ecm|usb_f_rndis|usb_f_acm|usb_f_mass_storage'
-```
-
-### Check ConfigFS
-
-```bash
-mount | grep configfs
-ls /sys/kernel/config/usb_gadget
-```
-
-### Check the gadget tree
-
-```bash
-find /sys/kernel/config/usb_gadget/pizero -maxdepth 4 -print
-```
-
-### Check the USB Ethernet interface
-
-```bash
-ip -br link
-ip -br addr
-```
-
-### Check ARP traffic
-
-On the Raspberry Pi:
-
-```bash
-sudo tcpdump -eni usb0 arp
-```
-
-On macOS, replacing `en6` as needed:
-
-```bash
-sudo tcpdump -eni en6 arp
-```
-
-### Check boot partition state
-
-```bash
-findmnt -S /dev/mmcblk0p1
-lsblk -f
-```
-
-When Mass Storage is active, the boot partition should normally be unmounted on the Raspberry Pi.
-
-### Check systemd logs
-
-```bash
-journalctl -u usb-gadget.service -b --no-pager
-```
-
-## Notes on VID/PID
-
-The supplied configuration uses Linux Foundation-style IDs for personal/lab use. For a product intended for distribution, use a properly assigned USB Vendor ID and Product ID.
-
-## Tested design goal
-
-The configuration is intended specifically to avoid relying on the legacy `g_ether` automatic behavior. The host-facing Ethernet function is explicitly selected through ConfigFS:
-
-```text
-macOS/Linux -> CDC ECM
-Windows     -> RNDIS
-```
-
-while ACM and Mass Storage can remain part of the same composite gadget.
+The Pi's DWC2 controller must be configured for peripheral/device mode. Do
+not configure it as a USB host while using this package.
